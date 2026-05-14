@@ -1,0 +1,70 @@
+# ===========================
+# Environnement virtuel
+# ===========================
+.venv/
+venv/
+env/
+ENV/
+
+# ===========================
+# Secrets & configuration
+# ===========================
+.env
+*.key
+secrets.py
+
+# ===========================
+# Cache projet
+# ===========================
+cache/
+*.pkl
+*.pickle
+
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+
+# ===========================
+# Jupyter
+# ===========================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===========================
+# Data & fichiers temporaires
+# ===========================
+data/~$*
+*.tmp
+*.bak
+*.swp
+
+# ===========================
+# OS
+# ===========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===========================
+# IDE
+# ===========================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ===========================
+# Archives / anciens dossiers
+# ===========================
+old/
+**/old/
+
+# ===========================
+# Data / Input
+# ===========================
+data/investment.xlsx
