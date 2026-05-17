@@ -1,5 +1,4 @@
 import os
-import time
 import threading
 import logging
 from typing import Callable, Optional
@@ -7,7 +6,12 @@ from typing import Callable, Optional
 import pandas as pd
 
 from config.settings import InflationConfig
-from services.cache import load_cache, save_cache
+from services.cache import (
+    load_cache,
+    save_cache,
+    is_cache_expired,
+    is_cache_nearly_expired,
+)
 
 
 class InflationService:
@@ -42,16 +46,28 @@ class InflationService:
     Cache policy
     ------------
     If force_refresh=False:
-        1. Memory cache (if valid)
-        2. Disk cache (if valid)
-        3. API loader
+        1. Memory cache — valid if is_cache_expired() confirms disk is fresh
+        2. Disk cache   — loaded via load_cache() (handles TTL + corruption)
+        3. API loader   — source of truth, persisted to disk + memory
 
     If force_refresh=True:
         → bypass ALL caches and call API directly
 
+    Cache utility responsibilities
+    ------------------------------
+    - is_cache_expired()        : lightweight TTL check (mtime only), used
+                                  for fast path validation without deserializing
+    - is_cache_nearly_expired() : proactive refresh trigger at 80% TTL,
+                                  used to warm cache before expiration
+    - load_cache()              : full load (TTL check + deserialization),
+                                  used once at disk cache resolution step
+    - save_cache()              : persistence to disk
+
     Notes
     -----
     Inflation data is assumed to be updated periodically (not real-time).
+    The single source of truth for TTL validity is the disk file mtime,
+    accessed via is_cache_expired() and load_cache() from services.cache.
     """
 
     def __init__(
@@ -59,9 +75,30 @@ class InflationService:
         loader: Callable[[InflationConfig], pd.Series],
         config: InflationConfig,
         cache_path: str = "cache/inflation.pkl",
-        max_age_seconds: int = 60,  # 3600,
+        max_age_seconds: int = 3600,
         auto_refresh_async: bool = False,
     ):
+        """
+        Initialize the InflationService.
+
+        Parameters
+        ----------
+        loader : Callable[[InflationConfig], pd.Series]
+            External function responsible for fetching inflation data
+            from a remote source (API, database, etc.).
+        config : InflationConfig
+            Configuration object passed to the loader.
+        cache_path : str, default "cache/inflation.pkl"
+            Path to the disk cache file.
+        max_age_seconds : int, default 3600
+            Maximum age of the cache in seconds before it is considered
+            stale. Applies to both memory and disk cache layers via
+            is_cache_expired() and load_cache().
+        auto_refresh_async : bool, default False
+            If True, triggers a background thread to refresh the cache
+            when the disk cache exceeds 80% of its TTL, without blocking
+            the caller.
+        """
         self._loader = loader
         self._config = config
 
@@ -69,7 +106,6 @@ class InflationService:
         # MEMORY CACHE STATE
         # -------------------------
         self._cache: Optional[pd.Series] = None
-        self._cache_timestamp: Optional[float] = None
 
         # -------------------------
         # CACHE CONFIG
@@ -112,12 +148,15 @@ class InflationService:
         Cache resolution order
         ----------------------
         If force_refresh=False:
-            1. Memory cache (if valid)
-            2. Disk cache (if valid)
-            3. API loader
+            1. Memory cache — valid if is_cache_expired() confirms disk
+               is still fresh. Lightweight check, no deserialization.
+            2. Disk cache   — loaded via load_cache() which handles TTL
+               check and deserialization in a single call.
+            3. API loader   — source of truth, result persisted to both
+               disk and memory cache.
 
         If force_refresh=True:
-            → API loader only
+            → API loader only, result persisted to disk + memory.
         """
 
         # ========================================================
@@ -128,16 +167,28 @@ class InflationService:
                 logger.info("InflationService: force refresh → API call")
 
             data = self._load_from_api(logger)
-            self._update_cache(data)
+            self._cache = data
             self._save_to_disk(data, logger)
             return data
 
         # ========================================================
         # 1. MEMORY CACHE FAST PATH
         # ========================================================
-        if self._cache is not None and not self._is_stale():
+        # is_cache_expired() provides a lightweight mtime-only check —
+        # no deserialization. load_cache() is reserved for the actual
+        # disk load at step 3.
+        if self._cache is not None and not is_cache_expired(
+            self._cache_path, self._max_age
+        ):
             if logger:
                 logger.debug("InflationService: memory cache hit")
+
+            # Proactive async refresh if nearing expiration (> 80% TTL)
+            if self._auto_refresh_async and is_cache_nearly_expired(
+                self._cache_path, self._max_age
+            ):
+                self._refresh_async(logger)
+
             return self._cache
 
         # ========================================================
@@ -145,8 +196,10 @@ class InflationService:
         # ========================================================
         with self._lock:
 
-            # double-check after lock
-            if self._cache is not None and not self._is_stale():
+            # double-check after lock acquisition
+            if self._cache is not None and not is_cache_expired(
+                self._cache_path, self._max_age
+            ):
                 return self._cache
 
             if logger:
@@ -154,18 +207,16 @@ class InflationService:
 
             # ====================================================
             # 3. DISK CACHE
+            # load_cache() handles TTL check + deserialization.
+            # Returns None if missing, expired, or corrupted.
             # ====================================================
             disk_data = self._load_from_disk(logger)
 
             if disk_data is not None:
-                self._update_cache(disk_data)
+                self._cache = disk_data
 
                 if logger:
                     logger.info("InflationService: loaded from disk cache")
-
-                # optional async refresh if stale
-                if self._is_stale() and self._auto_refresh_async:
-                    self._refresh_async(logger)
 
                 return self._cache
 
@@ -173,7 +224,7 @@ class InflationService:
             # 4. API LOAD (SOURCE OF TRUTH)
             # ====================================================
             data = self._load_from_api(logger)
-            self._update_cache(data)
+            self._cache = data
             self._save_to_disk(data, logger)
 
             if logger:
@@ -187,6 +238,21 @@ class InflationService:
     def _load_from_api(self, logger: Optional[logging.Logger]) -> pd.Series:
         """
         Call external loader (source of truth).
+
+        Parameters
+        ----------
+        logger : logging.Logger, optional
+            Logger used for tracing.
+
+        Returns
+        -------
+        pd.Series
+            Raw inflation time series from the remote source.
+
+        Raises
+        ------
+        ValueError
+            If the loader returns None or an empty Series.
         """
         if logger:
             logger.info("InflationService: loading from API...")
@@ -201,29 +267,23 @@ class InflationService:
     # ============================================================
     # CACHE HELPERS
     # ============================================================
-    def _update_cache(self, data: pd.Series) -> None:
-        """
-        Update in-memory cache.
-        """
-        self._cache = data
-        self._cache_timestamp = time.time()
-
-    def _is_stale(self) -> bool:
-        """
-        Check if memory cache is expired (TTL).
-        """
-        if self._cache_timestamp is None:
-            return True
-        return (time.time() - self._cache_timestamp) > self._max_age
-
     def _load_from_disk(self, logger: Optional[logging.Logger]) -> Optional[pd.Series]:
         """
-        Load inflation data from disk cache safely.
+        Load inflation data from disk cache via load_cache().
 
-        Returns None if:
-        - cache is missing
-        - cache is corrupted
-        - cache is expired
+        Delegates all TTL and validity checks to load_cache(), which
+        internally calls is_cache_expired() based on file mtime, then
+        deserializes the object if valid.
+
+        Parameters
+        ----------
+        logger : logging.Logger, optional
+            Logger used for tracing.
+
+        Returns
+        -------
+        pd.Series or None
+            Cached data if valid, None if missing, expired or corrupted.
         """
         try:
             data = load_cache(self._cache_path, max_age_seconds=self._max_age)
@@ -238,7 +298,14 @@ class InflationService:
 
     def _save_to_disk(self, data: pd.Series, logger: Optional[logging.Logger]) -> None:
         """
-        Persist inflation cache to disk (fail-safe).
+        Persist inflation data to disk cache (fail-safe).
+
+        Parameters
+        ----------
+        data : pd.Series
+            Inflation time series to persist.
+        logger : logging.Logger, optional
+            Logger used for tracing.
         """
         try:
             save_cache(self._cache_path, data)
@@ -254,7 +321,17 @@ class InflationService:
     # ============================================================
     def _refresh_async(self, logger: Optional[logging.Logger]) -> None:
         """
-        Background refresh of inflation cache (non-blocking).
+        Trigger a background refresh of the inflation cache (non-blocking).
+
+        Spawns a daemon thread that reloads data from the API and updates
+        both memory and disk cache. Invoked proactively when the disk cache
+        exceeds 80% of its TTL, so the cache is warmed before expiration.
+        Failures are logged but never propagate to the caller.
+
+        Parameters
+        ----------
+        logger : logging.Logger, optional
+            Logger used for tracing.
         """
 
         def _job():
@@ -263,8 +340,7 @@ class InflationService:
                     logger.info("InflationService: async refresh started")
 
                 data = self._load_from_api(logger)
-
-                self._update_cache(data)
+                self._cache = data
                 self._save_to_disk(data, logger)
 
                 if logger:

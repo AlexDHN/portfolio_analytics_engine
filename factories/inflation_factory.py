@@ -11,7 +11,6 @@ from config.settings import (
 from loaders.inflation_loader import load_inflation_series
 from services.inflation_service import InflationService
 
-
 # ============================================================
 # SINGLETON STATE (APPLICATION SCOPE)
 # ============================================================

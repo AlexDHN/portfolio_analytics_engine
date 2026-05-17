@@ -32,6 +32,29 @@ def is_cache_expired(path: str, max_age_seconds: int) -> bool:
     return False
 
 
+def is_cache_nearly_expired(
+    path: str, max_age_seconds: int, threshold: float = 0.8
+) -> bool:
+    """
+    Vérifie si le cache est valide mais proche de l'expiration.
+
+    Utile pour déclencher un refresh proactif avant que le cache
+    ne devienne invalide (stratégie "refresh before stale").
+
+    Args:
+        path (str): Chemin du fichier cache.
+        max_age_seconds (int): Durée maximale en secondes avant expiration.
+        threshold (float): Seuil de déclenchement (défaut 0.8 = 80% du TTL écoulé).
+
+    Returns:
+        bool: True si le cache est proche de l'expiration, False sinon.
+    """
+    if not os.path.exists(path):
+        return False
+    age = time.time() - os.path.getmtime(path)
+    return age > (max_age_seconds * threshold)
+
+
 def load_cache_file(path: str):
     """
     Charge un objet depuis le cache sans vérifier l'âge.

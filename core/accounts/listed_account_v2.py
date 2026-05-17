@@ -6,22 +6,39 @@ from typing import Optional, Dict
 from core.accounts.base_account import InvestmentAccount
 from core.investments.listed_v2 import ListedInvestment
 from core.market_data.manager_v3 import MarketDataManager
+from factories.inflation_factory import get_inflation_service
 from utils.logger import get_logger
 
 
 class ListedAccount(InvestmentAccount):
     """
+    ListedAccount
+    =============
+
     Concrete implementation of InvestmentAccount for listed instruments
     (e.g., PEA, CTO, or other brokerage accounts).
 
-    This class handles the preprocessing, initialization, and parallel
-    construction of `ListedInvestment` instances. It also manages integration
-    with a shared `MarketDataManager` to efficiently fetch and cache price data
-    across multiple tickers.
+    Overview
+    --------
+    This class orchestrates the full initialization pipeline for a listed
+    investment account:
 
-    The design supports large portfolios by leveraging parallel execution for
-    investment instantiation, ensuring scalable performance while maintaining
-    data integrity and reusability of market data resources.
+    - Transaction preprocessing and validation
+    - Shared resource initialization (MarketDataManager, inflation rates)
+    - Parallel construction of ListedInvestment instances
+
+    It acts as the **composition root** for all listed investments in the
+    account, resolving shared dependencies once and injecting them into
+    each investment — avoiding redundant loading across parallel workers.
+
+    Design principles
+    -----------------
+    - Shared dependencies (MarketDataManager, inflation rates) are resolved
+      once at the account level and injected into each ListedInvestment.
+    - Parallel instantiation via ThreadPoolExecutor ensures scalable
+      performance for large multi-asset portfolios.
+    - Thread-safe by design: all shared objects are read-only after
+      initialization and safe to pass across worker threads.
 
     Parameters
     ----------
@@ -30,13 +47,15 @@ class ListedAccount(InvestmentAccount):
         instruments. The index must be structured as:
             - level 0 : Ticker or instrument identifier
             - level 1 : Transaction date (datetime or string)
-
     stock_data_fs : pd.DataFrame
         Fractional share (rompus) reference data indexed by ticker and date.
-
+        Used during corporate action processing (e.g., stock splits).
     max_workers : Optional[int], default=None
-        Maximum number of worker threads to use for parallel investment
-        initialization. If None, defaults to the system’s available CPU cores.
+        Maximum number of worker threads for parallel investment initialization.
+        If None, defaults to the number of available CPU cores.
+    force_refresh : bool, default=False
+        If True, bypasses disk cache and forces a fresh download of market
+        data via MarketDataManager.
 
     Raises
     ------
@@ -47,25 +66,24 @@ class ListedAccount(InvestmentAccount):
     ----------
     logger : logging.Logger
         Class-specific logger for diagnostics and lifecycle tracing.
-
     stock_data_fs : pd.DataFrame
-        Fractional share reference data used for handling stock splits and
-        non-integer share quantities.
-
+        Fractional share reference data shared across all investments.
     market_data_manager : MarketDataManager
-        Shared data manager instance used to retrieve and cache market data
-        for all tickers referenced in the account.
-
+        Shared market data manager initialized once for all tickers in
+        the account. Provides OHLCV and corporate action data.
+    inflation_rates : pd.Series
+        Inflation time series resolved once via InflationService and
+        injected into each ListedInvestment. Indexed by date.
     tickers : pd.Index
-        Unique list of tickers (investment identifiers) detected from
-        transaction data.
+        Unique list of ticker symbols detected from transaction data.
 
     Notes
     -----
-    - Each investment is initialized as a `ListedInvestment`, receiving both
-      fractional share data and a shared `MarketDataManager` instance.
-    - Parallelization via ThreadPoolExecutor significantly reduces
-      initialization time for large multi-asset portfolios.
+    Shared dependency resolution order in __init__:
+        1. Preprocess and validate transactions
+        2. Initialize MarketDataManager (market data, once for all tickers)
+        3. Resolve inflation rates (once via InflationService singleton)
+        4. Build all ListedInvestment instances in parallel (injecting 2 & 3)
     """
 
     REQUIRED_COLUMNS = [
@@ -88,20 +106,39 @@ class ListedAccount(InvestmentAccount):
         max_workers: Optional[int] = None,
         force_refresh: bool = False,
     ):
+        """
+        Initialize the ListedAccount and all its ListedInvestment instances.
+
+        Shared dependencies are resolved once at this level and injected
+        into each investment, avoiding redundant loading across parallel
+        worker threads.
+
+        Parameters
+        ----------
+        transactions : pd.DataFrame
+            Raw MultiIndexed transaction data (level 0: ticker, level 1: date).
+        stock_data_fs : pd.DataFrame
+            Fractional share reference data indexed by ticker and date.
+        max_workers : Optional[int], default=None
+            Number of parallel threads for investment construction.
+            Defaults to available CPU cores if None.
+        force_refresh : bool, default=False
+            Forces market data refresh, bypassing disk cache.
+        """
         self.logger = get_logger(self.__class__.__name__)
         self.max_workers = max_workers
         self.stock_data_fs = stock_data_fs
 
-        # Preprocess and validate transactions
+        # --- 1. Preprocess and validate transactions ---
         df = self._preprocess_transactions(transactions)
 
-        # Detect all relevant tickers
+        # --- 2. Detect all relevant tickers ---
         self.tickers = df.index.get_level_values(0).unique()
         self.logger.debug("Detected tickers: %s", list(self.tickers))
 
         all_tickers = self.tickers.union(df["indice"].unique())
 
-        # Initialize MarketDataManager once for all tickers
+        # --- 3. Initialize MarketDataManager once for all tickers ---
         self.market_data_manager = MarketDataManager(
             tickers=list(all_tickers), force_refresh=force_refresh
         )
@@ -110,7 +147,16 @@ class ListedAccount(InvestmentAccount):
             len(all_tickers),
         )
 
-        # Initialize via abstract parent
+        # --- 4. Resolve inflation rates once for all investments ---
+        # Resolved here at the account level to avoid N redundant calls
+        # across parallel ListedInvestment workers. Injected as a read-only
+        # pd.Series — safe to share across threads.
+        self.inflation_rates = get_inflation_service().get_inflation_rates(self.logger)
+        self.logger.info(
+            "Inflation rates resolved for %d periods", len(self.inflation_rates)
+        )
+
+        # --- 5. Initialize via abstract parent (triggers _build_investments_parallel) ---
         super().__init__(df)
 
     # -------------------------------------------------------------------------
@@ -118,14 +164,16 @@ class ListedAccount(InvestmentAccount):
     # -------------------------------------------------------------------------
     def _preprocess_transactions(self, transactions: pd.DataFrame) -> pd.DataFrame:
         """
-        Preprocess raw transaction DataFrame for ListedInvestment compatibility.
+        Preprocess and validate raw transaction data for ListedInvestment
+        compatibility.
 
-        Steps:
-        - Validate required columns exist
-        - Fill missing values for fees
-        - Initialize adjusted and tracking columns
-        - Add an empty date placeholder
-        - Sort and return a clean DataFrame
+        Steps
+        -----
+        1. Validate that all required columns are present.
+        2. Sort by index and copy to avoid mutating the input.
+        3. Fill missing fee values with 0.0.
+        4. Initialize adjusted and tracking columns.
+        5. Add an empty date placeholder column.
 
         Parameters
         ----------
@@ -140,7 +188,7 @@ class ListedAccount(InvestmentAccount):
         Raises
         ------
         ValueError
-            If required columns are missing in the input DataFrame.
+            If one or more required columns are missing from the input.
         """
         # === 1. Validate required columns ===
         missing_cols = set(self.REQUIRED_COLUMNS) - set(transactions.columns)
@@ -151,7 +199,7 @@ class ListedAccount(InvestmentAccount):
             )
         self.logger.debug("All required columns are present")
 
-        # === 2. Sort by index and make a copy to avoid mutating input ===
+        # === 2. Sort by index and copy to avoid mutating input ===
         df = transactions.sort_index().copy()
         self.logger.debug("Transactions sorted by index")
 
@@ -176,29 +224,36 @@ class ListedAccount(InvestmentAccount):
         return df
 
     # -------------------------------------------------------------------------
-    # Parallel Investment Initialization
+    # Parallel Investment Construction
     # -------------------------------------------------------------------------
     def _build_investments_parallel(self) -> pd.Series:
         """
         Construct all ListedInvestment instances in parallel using thread workers.
 
-        Each worker initializes a `ListedInvestment` with:
-        - Its corresponding transaction subset
-        - Fractional share data (if available)
-        - The shared `MarketDataManager` instance for market data access
+        Each worker receives:
+        - Its corresponding transaction subset (ticker-scoped)
+        - Fractional share data for that ticker (empty DataFrame if absent)
+        - The shared MarketDataManager (read-only, thread-safe)
+        - The pre-resolved inflation rates (read-only pd.Series, thread-safe)
+
+        Shared dependencies are injected rather than resolved per-worker,
+        ensuring a single load per account initialization regardless of the
+        number of tickers.
 
         Returns
         -------
         pd.Series
-            Series of successfully initialized `ListedInvestment` instances,
-            indexed by ticker symbol.
+            Series of successfully initialized ListedInvestment instances,
+            indexed by ticker symbol. Failed initializations are logged and
+            excluded from the result.
         """
         investments: Dict[str, ListedInvestment] = {}
 
         self.logger.info(
-            "Starting parallel construction of ListedInvestment objects for %d tickers with %d workers",
+            "Starting parallel construction of %d ListedInvestment objects "
+            "with %s workers",
             len(self.transactions.index.get_level_values(0).unique()),
-            self.max_workers,
+            self.max_workers or "default",
         )
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -213,6 +268,7 @@ class ListedAccount(InvestmentAccount):
                         else pd.DataFrame()
                     ),
                     self.market_data_manager,
+                    self.inflation_rates,  # injected once, shared across all workers
                 ): name
                 for name, group in self.transactions.groupby(level=0)
             }
@@ -225,5 +281,9 @@ class ListedAccount(InvestmentAccount):
                 except Exception as e:
                     self.logger.error("Failed to initialize %s: %s", name, e)
 
-        self.logger.info("Successfully built %d listed investments", len(investments))
+        self.logger.info(
+            "Successfully built %d / %d listed investments",
+            len(investments),
+            len(self.tickers),
+        )
         return pd.Series(investments)

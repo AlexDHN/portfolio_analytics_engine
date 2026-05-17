@@ -18,61 +18,90 @@ CACHE_MAX_AGE = 60  # 3600  # 60 minutes
 
 class ListedInvestment(Investment):
     """
-    Represent a listed investment such as a stock or ETF.
+    ListedInvestment
+    ================
 
-    This class manages transactions, downloads and caches historical market data,
-    applies corporate actions (e.g., stock splits), and builds one or two timelines
-    of investment states over time:
+    Represents a listed investment instrument such as a stock or ETF.
 
-    - `timeline`: the timeline computed from the actual transactions.
-    - `simulated_timeline`: (optional) the timeline computed in *simulate* mode,
-       which treats sold positions as if they had not been removed (simulated positions).
-       The simulate mode is useful to preview "what if sold positions had remained" and
-       to evaluate allocation of fractional shares in a simulated scenario.
+    Overview
+    --------
+    This class manages the full lifecycle of a listed position:
 
-    Market data handling is centralized through the provided `MarketDataManager`,
-    allowing efficient caching and potential parallelized retrieval across multiple
-    investments in a portfolio.
+    - Transaction ingestion and adjustment (splits, fees, taxes)
+    - Historical market data retrieval via a shared MarketDataManager
+    - Corporate action processing (e.g., stock splits)
+    - Timeline construction from actual and simulated transactions
+    - Inflation-adjusted return computation via injected rates
+
+    It is designed for integration into multi-asset portfolio engines,
+    supporting parallel instantiation across large ticker universes.
+
+    Timelines
+    ---------
+    Two timelines may be constructed depending on position history:
+
+    - ``timeline``
+        Built from actual transactions. Represents the real investment
+        state over time, including closed positions.
+
+    - ``simulated_timeline``
+        Built from simulated transactions derived from closed positions.
+        Treats sold positions as if they had remained held. Useful for:
+            - "what if" analysis on early exits
+            - fractional share allocation in simulated scenarios
+            - performance attribution vs. a hold strategy
+
+    Design principles
+    -----------------
+    - Market data is centralized in a shared MarketDataManager, avoiding
+      redundant downloads across investments in the same portfolio.
+    - Inflation rates are injected at construction time (resolved once
+      upstream by ListedAccount) and never fetched internally.
+    - Thread-safe by design: no shared mutable state beyond injected
+      read-only dependencies.
 
     Parameters
     ----------
     name : str
         Ticker symbol of the listed instrument (e.g., "AAPL", "AI.PA").
     transactions : pd.DataFrame
-        Transaction-level DataFrame containing adjusted fields such as:
-        'count_adj', 'value_adj', 'fees_adj', 'tax_adj', 'fs_adj', 'indice', 'empty_date'.
+        Transaction-level DataFrame containing adjusted fields:
+        'count_adj', 'value_adj', 'fees_adj', 'tax_adj', 'fs_adj',
+        'indice', 'empty_date'.
     fractional_share_data : pd.DataFrame
-        Optional DataFrame with market values to allocate fractional shares (rompus),
-        typically indexed by ticker and date.
+        Reference data for fractional share (rompus) allocation,
+        typically produced by stock split events. May be empty.
     market_data_manager : MarketDataManager
-        Pre-initialized manager responsible for downloading, caching, and providing
-        historical market data for all tickers in the portfolio.
+        Shared manager responsible for downloading, caching, and serving
+        historical OHLCV and corporate action data for all portfolio tickers.
+    inflation_rates : pd.Series
+        Preloaded inflation time series indexed by date, injected from
+        the upstream ListedAccount. Used for real return computations.
 
     Attributes
     ----------
     name : str
-        Ticker symbol of the listed instrument (e.g., "AAPL").
+        Ticker symbol of the instrument (e.g., "AAPL", "AI.PA").
     transactions : pd.DataFrame
-        Transaction-level DataFrame containing adjusted fields such as:
-        'count_adj', 'value_adj', 'fees_adj', 'tax_adj', 'fs_adj', 'indice', 'empty_date'...
+        Adjusted transaction history (buys, sells, splits, fees, taxes).
     market_data : pd.DataFrame
-        Historical market data (OHLCV, 'Stock Splits', etc.) downloaded via yfinance.
+        Historical OHLCV data enriched with corporate actions
+        (e.g., 'Stock Splits') retrieved via MarketDataManager.
     fractional_share_data : pd.DataFrame
-        Optional DataFrame containing market values to be used when allocating
-        fractional shares (rompus) produced by splits. Indexed by (ticker, date) or
-        by date depending on upstream convention.
+        Fractional share reference data used during split processing.
     timeline : pd.DataFrame
-        Timeline of positions and metrics computed from `transactions`.
+        Position and performance timeline derived from actual transactions.
     closed_positions : pd.DataFrame
-        DataFrame of compensations resulting from short/ sale matching (may be empty).
+        Matched short/sale compensations. Empty if no positions were closed.
     simulated_transactions : pd.DataFrame
-        When `closed_positions` is non-empty, a derived DataFrame of simulated transactions
-        (short-sale compensations converted into synthetic "simulated buys") used to run
-        a simulated timeline.
+        Synthetic transaction set derived from closed_positions, used to
+        reconstruct a simulated hold scenario. Only populated when
+        closed_positions is non-empty.
     simulated_timeline : pd.DataFrame
-        Timeline computed in simulate mode (treats sold positions as still held).
+        Timeline computed in simulate mode. Only populated when
+        closed_positions is non-empty.
     logger : logging.Logger
-        Logger instance for this investment.
+        Logger instance scoped to this investment.
     """
 
     def __init__(
@@ -81,27 +110,34 @@ class ListedInvestment(Investment):
         transactions: pd.DataFrame,
         fractional_share_data: pd.DataFrame,
         market_data_manager: MarketDataManager,
+        inflation_rates: pd.Series,
     ):
         """
-        Initialize a ListedInvestment object.
+        Initialize a ListedInvestment.
 
         Parameters
         ----------
         name : str
-            The ticker symbol (e.g., "AAPL", "AI.PA").
+            Ticker symbol of the listed instrument (e.g., "AAPL", "AI.PA").
         transactions : pd.DataFrame
-            Transaction history for this investment (buys, sells, fees, etc.).
+            Adjusted transaction history for this instrument.
         fractional_share_data : pd.DataFrame
-            Data for fractional share adjustments and related events.
+            Fractional share reference data for split adjustments.
+            Pass an empty DataFrame if not applicable.
+        market_data_manager : MarketDataManager
+            Shared market data manager. Must be pre-initialized with all
+            relevant tickers before ListedInvestment instantiation.
+        inflation_rates : pd.Series
+            Inflation time series indexed by date. Must be resolved once
+            upstream (e.g., in ListedAccount) and injected here to avoid
+            redundant loading across parallel investment instantiations.
         """
         self.logger = get_logger(self.__class__.__name__)
-        self.logger.info("Initializing Listed investment for %s", name)
+        self.logger.info("Initializing ListedInvestment for %s", name)
 
         self.name = name
         self.transactions = transactions
-
-        # --- Load or download inflation data ---
-        self._inflation_rates = get_inflation_service().get_inflation_rates(self.logger)
+        self._inflation_rates = inflation_rates
 
         # --- Load or download market data ---
         self.market_data = market_data_manager.get_market_data(self.name)
