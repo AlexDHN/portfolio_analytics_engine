@@ -11,7 +11,7 @@ MIN_DATE = datetime(year=2023, month=5, day=1)
 
 # === PARAMÈTRES GÉNÉRAUX ===
 INVESTMENT_PATH = "investment.xlsx"
-DRIVER_PATH = "C:/Users/Alexandre/Documents/DHN life/investment/chromedriver-win64/chromedriver.exe"
+DRIVER_PATH = os.getenv("DRIVER_PATH")
 
 # === CLÉS D'API ===
 BDF_API_KEY = os.getenv("BDF_API_KEY")
